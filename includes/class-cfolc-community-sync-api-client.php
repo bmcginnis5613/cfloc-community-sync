@@ -60,90 +60,56 @@ final class CFOLC_Community_Sync_API_Client {
 	}
 
 	private function add_buddyboss_groups( array $result ) {
-		$namespace = 'buddyboss/v1';
+		$user_ids = array();
+		foreach ( $result['users'] as $source_user ) {
+			if ( ! is_array( $source_user ) || empty( $source_user['id'] ) || (int) $source_user['id'] < 1 ) {
+				return new WP_Error( 'cfolc_sync_invalid_response', 'The source returned a user without a valid ID.' );
+			}
+			$user_ids[] = (int) $source_user['id'];
+		}
+		if ( empty( $user_ids ) ) {
+			return $result;
+		}
+
+		$response = $this->request(
+			'/wp-json/cfolc-sync/v1/user-groups',
+			array( 'user_ids' => implode( ',', array_unique( $user_ids ) ) )
+		);
+		if ( is_wp_error( $response ) ) {
+			return new WP_Error( 'cfolc_sync_groups_request_failed', 'Bulk BuddyBoss groups could not be read: ' . $response->get_error_message() );
+		}
+		if ( ! is_array( $response ) || ! isset( $response['users'] ) || ! is_array( $response['users'] ) ) {
+			return new WP_Error( 'cfolc_sync_invalid_groups_response', 'The bulk groups endpoint returned an unexpected response.' );
+		}
+
+		$groups_by_user = array();
+		foreach ( $response['users'] as $user ) {
+			if ( ! is_array( $user ) || ! isset( $user['id'], $user['groups'] ) || ! is_int( $user['id'] ) || ! in_array( $user['id'], $user_ids, true ) || ! is_array( $user['groups'] ) || array_key_exists( $user['id'], $groups_by_user ) ) {
+				return new WP_Error( 'cfolc_sync_invalid_groups_response', 'The bulk groups endpoint returned an invalid or duplicate user entry.' );
+			}
+			$names = array();
+			foreach ( $user['groups'] as $name ) {
+				if ( ! is_string( $name ) || '' === trim( sanitize_text_field( $name ) ) ) {
+					return new WP_Error( 'cfolc_sync_invalid_groups_response', 'The bulk groups endpoint returned an invalid group name.' );
+				}
+				$names[] = trim( sanitize_text_field( $name ) );
+			}
+			$names = array_unique( $names );
+			natcasesort( $names );
+			$groups_by_user[ $user['id'] ] = array_values( $names );
+		}
+
+		// Missing users are a failed read, never an empty membership list.
+		foreach ( $user_ids as $user_id ) {
+			if ( ! array_key_exists( $user_id, $groups_by_user ) ) {
+				return new WP_Error( 'cfolc_sync_invalid_groups_response', sprintf( 'The bulk groups endpoint omitted source user %d. The batch was not applied.', $user_id ) );
+			}
+		}
 		foreach ( $result['users'] as &$source_user ) {
-			$user_id = isset( $source_user['id'] ) ? (int) $source_user['id'] : 0;
-			if ( ! $user_id ) {
-				continue;
-			}
-
-			$groups = $this->request_user_groups( $namespace, $user_id );
-			if ( is_wp_error( $groups ) && 404 === (int) $groups->get_error_data( 'cfolc_sync_source_response' ) && 'buddyboss/v1' === $namespace ) {
-				$namespace = 'buddypress/v1';
-				$groups    = $this->request_user_groups( $namespace, $user_id );
-			}
-			if ( is_wp_error( $groups ) ) {
-				unset( $source_user );
-				return new WP_Error( 'cfolc_sync_groups_request_failed', sprintf( 'BuddyBoss groups for source user %1$d could not be read: %2$s', $user_id, $groups->get_error_message() ) );
-			}
-
-			$source_user['_cfolc_buddyboss_groups'] = $this->filter_chapter_group_names( $groups );
+			$source_user['_cfolc_buddyboss_groups'] = $groups_by_user[ (int) $source_user['id'] ];
 		}
 		unset( $source_user );
 		return $result;
-	}
-
-	private function request_user_groups( $namespace, $user_id ) {
-		$groups = array();
-		$page   = 1;
-		do {
-			$response = $this->request(
-				'/wp-json/' . $namespace . '/groups',
-				array(
-					'context'         => 'edit',
-					'user_id'         => (int) $user_id,
-					'show_hidden'     => true,
-					'populate_extras' => false,
-					'per_page'        => 100,
-					'page'            => $page,
-					'_fields'         => 'id,name,types,group_type_label,group_type',
-				),
-				true
-			);
-			if ( is_wp_error( $response ) ) {
-				return $response;
-			}
-			$groups      = array_merge( $groups, $response['items'] );
-			$total_pages = $response['total_pages'];
-			++$page;
-		} while ( $page <= $total_pages );
-		return $groups;
-	}
-
-	private function filter_chapter_group_names( $groups ) {
-		if ( ! is_array( $groups ) ) {
-			return array();
-		}
-		$names = array();
-		foreach ( $groups as $group ) {
-			if ( ! is_array( $group ) || empty( $group['name'] ) ) {
-				continue;
-			}
-
-			$type_values = isset( $group['types'] ) && is_array( $group['types'] ) ? $group['types'] : array();
-			if ( ! empty( $group['group_type_label'] ) ) {
-				$type_values[] = $group['group_type_label'];
-			}
-			if ( isset( $group['group_type'] ) && is_array( $group['group_type'] ) ) {
-				if ( ! empty( $group['group_type']['group_type_label'] ) ) {
-					$type_values[] = $group['group_type']['group_type_label'];
-				}
-				if ( isset( $group['group_type']['types'] ) && is_array( $group['group_type']['types'] ) ) {
-					$type_values = array_merge( $type_values, $group['group_type']['types'] );
-				}
-			}
-
-			$types = array_map( 'sanitize_title', array_filter( $type_values, 'is_scalar' ) );
-			if ( empty( array_intersect( self::ALLOWED_GROUP_TYPES, $types ) ) ) {
-				continue;
-			}
-			$name = trim( sanitize_text_field( (string) $group['name'] ) );
-			if ( '' !== $name && ! in_array( $name, $names, true ) ) {
-				$names[] = $name;
-			}
-		}
-		natcasesort( $names );
-		return array_values( $names );
 	}
 
 	private function request( $path, array $query = array(), $include_pagination = false ) {
