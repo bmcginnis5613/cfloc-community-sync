@@ -10,6 +10,7 @@ final class CFOLC_Community_Sync_Scheduler {
 	const WATCHDOG_HOOK = 'cfolc_community_sync_watchdog';
 	const STATE_OPTION = 'cfolc_community_sync_state';
 	const LOCK_OPTION  = 'cfolc_community_sync_batch_lock';
+	const START_LOCK_OPTION = 'cfolc_community_sync_start_lock';
 	const WATCHDOG_LOCK_OPTION = 'cfolc_community_sync_watchdog_lock';
 	const REST_NAMESPACE = 'cfolc-community-sync/v1';
 	const REST_ROUTE     = '/run-batch';
@@ -26,6 +27,7 @@ final class CFOLC_Community_Sync_Scheduler {
 		self::ensure_watchdog_scheduled();
 		self::recover_stalled_run();
 		self::ensure_running_batch_scheduled();
+		self::ensure_automatic_run_scheduled();
 	}
 
 	public static function register_rest_route() {
@@ -74,6 +76,7 @@ final class CFOLC_Community_Sync_Scheduler {
 		wp_clear_scheduled_hook( self::BATCH_HOOK );
 		wp_clear_scheduled_hook( self::WATCHDOG_HOOK );
 		delete_option( self::LOCK_OPTION );
+		delete_option( self::START_LOCK_OPTION );
 		delete_option( self::WATCHDOG_LOCK_OPTION );
 	}
 
@@ -146,10 +149,24 @@ final class CFOLC_Community_Sync_Scheduler {
 			return;
 		}
 
-		// We are already inside a background cron request, so execute batch one
-		// here. Relying exclusively on a second HTTP loopback can leave a run in
-		// "running / 0 of 0" when loopbacks are blocked by the host or a WAF.
-		self::start_new_run( false, 0, true );
+		$lock_token = wp_generate_uuid4();
+		if ( ! self::acquire_start_lock( $lock_token ) ) {
+			return;
+		}
+
+		try {
+			$state = self::get_state();
+			if ( 'running' === $state['status'] ) {
+				return;
+			}
+
+			// Cron requests can safely execute batch one here. When a normal page
+			// request repairs an overdue event, use the asynchronous worker so the
+			// visitor is not made to wait for the batch.
+			self::start_new_run( false, 0, self::is_cron_request() );
+		} finally {
+			self::release_start_lock( $lock_token );
+		}
 	}
 
 	public static function start_new_run( $manual = true, $stall_retry = 0, $run_immediately = false ) {
@@ -384,6 +401,48 @@ final class CFOLC_Community_Sync_Scheduler {
 		}
 	}
 
+	/**
+	 * Keep the persisted next-run value and the real WP-Cron event in sync.
+	 *
+	 * WordPress single events can be removed by cron cleanup, cache restores,
+	 * or deployment tooling. WP-Cron can also be disabled even while ordinary
+	 * site traffic continues. In either case, repair the missing event and start
+	 * an overdue check from the current request.
+	 */
+	private static function ensure_automatic_run_scheduled() {
+		$settings = CFOLC_Community_Sync_Settings::get();
+		if ( empty( $settings['automatic_checks'] ) ) {
+			return;
+		}
+
+		$state = self::get_state();
+		if ( 'running' === $state['status'] ) {
+			return;
+		}
+
+		$now       = time();
+		$scheduled = (int) wp_next_scheduled( self::START_HOOK );
+
+		if ( $scheduled > $now ) {
+			if ( (int) $state['next_run_at'] !== $scheduled ) {
+				self::set_next_run( $scheduled );
+			}
+			return;
+		}
+
+		if ( $scheduled ) {
+			wp_unschedule_event( $scheduled, self::START_HOOK );
+		}
+
+		$next_run = (int) $state['next_run_at'];
+		if ( $next_run > $now ) {
+			self::schedule_start( $next_run );
+			return;
+		}
+
+		self::start_scheduled_run();
+	}
+
 	private static function recover_stalled_run() {
 		$state = self::get_state();
 		$last_activity = ! empty( $state['last_activity_at'] ) ? (int) $state['last_activity_at'] : (int) $state['started_at'];
@@ -441,8 +500,16 @@ final class CFOLC_Community_Sync_Scheduler {
 	}
 
 	private static function schedule_start( $timestamp ) {
-		wp_schedule_single_event( (int) $timestamp, self::START_HOOK );
-		self::set_next_run( (int) $timestamp );
+		$timestamp = (int) $timestamp;
+		wp_schedule_single_event( $timestamp, self::START_HOOK );
+		$scheduled = (int) wp_next_scheduled( self::START_HOOK );
+		self::set_next_run( $scheduled ? $scheduled : $timestamp );
+
+		if ( ! $scheduled ) {
+			$logger = new CFOLC_Community_Sync_Logger();
+			$logger->log( 'error', 'Could not schedule the next automatic check. Check the WordPress cron configuration.' );
+			$logger->flush();
+		}
 	}
 
 	private static function schedule_batch( $run_id, $page, $retry, $delay ) {
@@ -557,6 +624,34 @@ final class CFOLC_Community_Sync_Scheduler {
 			'',
 			'no'
 		);
+	}
+
+	private static function acquire_start_lock( $token ) {
+		$lock = get_option( self::START_LOCK_OPTION, array() );
+		if ( is_array( $lock ) && ! empty( $lock['created_at'] ) && (int) $lock['created_at'] > time() - MINUTE_IN_SECONDS ) {
+			return false;
+		}
+
+		if ( $lock ) {
+			delete_option( self::START_LOCK_OPTION );
+		}
+
+		return add_option(
+			self::START_LOCK_OPTION,
+			array(
+				'token'      => $token,
+				'created_at' => time(),
+			),
+			'',
+			'no'
+		);
+	}
+
+	private static function release_start_lock( $token ) {
+		$lock = get_option( self::START_LOCK_OPTION, array() );
+		if ( is_array( $lock ) && isset( $lock['token'] ) && hash_equals( (string) $lock['token'], (string) $token ) ) {
+			delete_option( self::START_LOCK_OPTION );
+		}
 	}
 
 	private static function release_lock( $token ) {

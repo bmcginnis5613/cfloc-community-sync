@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CFOLC Community Sync
  * Description: Sync data from one WordPress site to another.
- * Version: 1.0.0
+ * Version: 1.7.1
  * Author: FirstTracks Marketing
  * Author URI: https://firsttracksmarketing.com
  */
@@ -11,7 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CFOLC_COMMUNITY_SYNC_VERSION', '1.7.0' );
+define( 'CFOLC_COMMUNITY_SYNC_VERSION', '1.7.1' );
 define( 'CFOLC_COMMUNITY_SYNC_FILE', __FILE__ );
 define( 'CFOLC_COMMUNITY_SYNC_DIR', plugin_dir_path( __FILE__ ) );
 
